@@ -1,0 +1,246 @@
+"""
+Attendance Agent
+================
+Applies attendance rules and absence penalties to StudentScore objects.
+
+Reads data/input/medical_exceptions.json for medical exemptions.
+All penalty weights come from config/scoring_config.json.
+
+Rules
+-----
+1. Present + active >= min_hours  → scored normally (base + attendance bonus)
+2. Present + active < min_hours   → scored, but NO attendance bonus
+3. Medical exception on file      → 0 pts, no penalty, marked exempt
+4. Absent with no medical         → unexcused_penalty applied (-20)
+
+Prints a clear summary table of exempted vs penalised students.
+"""
+
+import json
+import warnings
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+from dataclasses import replace
+
+from models import StudentScore
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "scoring_config.json"
+_MEDICAL_INPUT = (
+    Path(__file__).resolve().parent.parent / "data" / "input" / "medical_exceptions.json"
+)
+
+# ---------------------------------------------------------------------------
+# Loaders
+# ---------------------------------------------------------------------------
+
+
+def _load_config() -> Dict:
+    return json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+
+
+def _load_medical_exceptions(
+    filepath: Optional[str] = None,
+) -> Dict[Tuple[str, str], str]:
+    """
+    Load medical exceptions keyed by (hostname, date).
+
+    Returns
+    -------
+    dict  { (hostname, date): reason }
+    Empty dict if file missing / malformed.
+    """
+    path = Path(filepath) if filepath else _MEDICAL_INPUT
+
+    if not path.exists():
+        return {}
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        entries = raw.get("exceptions", [])
+        return {
+            (e["hostname"], e["date"]): e.get("reason", "medical")
+            for e in entries
+        }
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Core logic
+# ---------------------------------------------------------------------------
+
+
+def apply_attendance(
+    score: StudentScore,
+    medical_map: Optional[Dict[Tuple[str, str], str]] = None,
+    filepath: Optional[str] = None,
+) -> StudentScore:
+    """
+    Apply attendance rules and penalties to a single StudentScore.
+
+    Parameters
+    ----------
+    score : StudentScore
+        Score after base + bonus agents have run.
+    medical_map : dict | None
+        Pre-loaded medical exceptions. If None, loaded from file.
+    filepath : str | None
+        Override path to medical_exceptions.json.
+
+    Returns
+    -------
+    StudentScore with updated penalty, attend_bonus, and total_pts.
+    """
+    cfg = _load_config()
+
+    if medical_map is None:
+        medical_map = _load_medical_exceptions(filepath)
+
+    min_hours = cfg["min_hours_for_attendance"]
+    unexcused_pen = cfg["unexcused_penalty"]  # negative value
+
+    key = (score.student_id, score.date)
+
+    # --- Medical exemption ------------------------------------------------
+    if key in medical_map:
+        return replace(
+            score,
+            base_pts=0,
+            attend_bonus=0,
+            activity_bonus=0,
+            beh_bonus=0,
+            penalty=0,
+            total_pts=0,
+            grade="Exempt",
+            active_hours=0,
+        )
+
+    # --- Absent unexcused -------------------------------------------------
+    if score.active_hours == 0 and score.base_pts == 0:
+        new_total = round(score.total_pts + unexcused_pen, 2)
+        return replace(
+            score,
+            penalty=unexcused_pen,
+            total_pts=new_total,
+        )
+
+    # --- Present but below min hours → strip attendance bonus -------------
+    if score.active_hours < min_hours and score.attend_bonus > 0:
+        new_total = round(score.total_pts - score.attend_bonus, 2)
+        return replace(
+            score,
+            attend_bonus=0,
+            total_pts=new_total,
+        )
+
+    # --- Present and active enough → no changes --------------------------
+    return score
+
+
+# ---------------------------------------------------------------------------
+# Batch helper + summary printer
+# ---------------------------------------------------------------------------
+
+
+def apply_attendance_all(
+    scores: List[StudentScore],
+    filepath: Optional[str] = None,
+) -> List[StudentScore]:
+    """
+    Apply attendance rules to a list of StudentScores and print a summary.
+    """
+    medical_map = _load_medical_exceptions(filepath)
+    results: List[StudentScore] = []
+
+    exempted: List[Tuple[str, str, str]] = []   # (name, date, reason)
+    penalised: List[Tuple[str, str, float]] = []  # (name, date, penalty)
+    normal: List[Tuple[str, str]] = []           # (name, date)
+
+    for s in scores:
+        updated = apply_attendance(s, medical_map=medical_map)
+        results.append(updated)
+
+        key = (s.student_id, s.date)
+        if key in medical_map:
+            exempted.append((s.name, s.date, medical_map[key]))
+        elif updated.penalty < 0:
+            penalised.append((s.name, s.date, updated.penalty))
+        else:
+            normal.append((s.name, s.date))
+
+    # --- Print summary ---------------------------------------------------
+    _print_summary(exempted, penalised, normal)
+
+    return results
+
+
+def _print_summary(exempted, penalised, normal):
+    """Print a clear attendance summary table."""
+    width = 60
+    print("\n" + "=" * width)
+    print("  ATTENDANCE SUMMARY")
+    print("=" * width)
+
+    if exempted:
+        print("\n  ✚ MEDICAL EXEMPTIONS (0 pts, no penalty)")
+        print("  " + "-" * (width - 2))
+        for name, date, reason in exempted:
+            print(f"    {name:<20} {date}   reason: {reason}")
+
+    if penalised:
+        print("\n  ✖ UNEXCUSED ABSENCES (penalty applied)")
+        print("  " + "-" * (width - 2))
+        for name, date, pen in penalised:
+            print(f"    {name:<20} {date}   penalty: {pen}")
+
+    if normal:
+        print("\n  ✔ PRESENT / SCORED NORMALLY")
+        print("  " + "-" * (width - 2))
+        for name, date in normal:
+            print(f"    {name:<20} {date}")
+
+    print("\n" + "=" * width)
+    print(
+        f"  Total: {len(normal)} scored  |  "
+        f"{len(exempted)} exempt  |  "
+        f"{len(penalised)} penalised"
+    )
+    print("=" * width + "\n")
+
+
+# ---------------------------------------------------------------------------
+# CLI quick-test
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    from models import ActivityRecord, AbsenceType
+    from agents.base_points_agent import calculate_base_score
+    from agents.bonus_points_agent import apply_bonus
+
+    records = [
+        ActivityRecord(
+            student_id="sumukhsp", hostname="SUMUKH-PC",
+            date="2026-05-05", total_hours=0, active_hours=0,
+            attendance=AbsenceType.ABSENT,
+        ),
+        ActivityRecord(
+            student_id="harikrishna", hostname="HARI-PC",
+            date="2026-05-05", total_hours=6.0, active_hours=5.0,
+            attendance=AbsenceType.PRESENT,
+        ),
+        ActivityRecord(
+            student_id="supreeth", hostname="SUPREETH-PC",
+            date="2026-05-05", total_hours=3.0, active_hours=1.5,
+            attendance=AbsenceType.PRESENT,
+        ),
+    ]
+
+    scores = [apply_bonus(calculate_base_score(r)) for r in records]
+    final = apply_attendance_all(scores)
+
+    for s in final:
+        print(f"  {s.name:<20} total={s.total_pts:>6}  penalty={s.penalty:>6}  grade={s.grade}")

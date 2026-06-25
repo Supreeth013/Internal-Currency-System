@@ -1,0 +1,244 @@
+"""
+Aggregator Agent
+================
+Merges all StudentScore objects into a ranked leaderboard,
+persists weekly JSON, cumulative JSON, and a CSV report.
+"""
+
+import csv
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from models import StudentScore, WeeklyReport
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+_OUTPUT = Path(__file__).resolve().parent.parent / "data" / "output"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _ensure_output():
+    _OUTPUT.mkdir(parents=True, exist_ok=True)
+
+
+def _score_to_dict(s: StudentScore, flagged: Optional[List[str]] = None) -> Dict:
+    return {
+        "student_id": s.student_id,
+        "name": s.name,
+        "date": s.date,
+        "active_hours": s.active_hours,
+        "base_pts": s.base_pts,
+        "attend_bonus": s.attend_bonus,
+        "activity_bonus": s.activity_bonus,
+        "beh_bonus": s.beh_bonus,
+        "penalty": s.penalty,
+        "total_pts": s.total_pts,
+        "grade": s.grade,
+        "flagged_apps": flagged or [],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Weekly JSON
+# ---------------------------------------------------------------------------
+
+
+def save_weekly_json(
+    week_ending: str,
+    scores: List[StudentScore],
+    flagged_map: Optional[Dict[str, List[str]]] = None,
+) -> str:
+    """Save data/output/scores_YYYY-MM-DD.json and return the path."""
+    _ensure_output()
+    flagged_map = flagged_map or {}
+
+    ranked = sorted(scores, key=lambda s: s.total_pts, reverse=True)
+    payload = {
+        "week_ending": week_ending,
+        "generated_at": datetime.now().isoformat(),
+        "students": [
+            _score_to_dict(s, flagged_map.get(s.student_id, []))
+            for s in ranked
+        ],
+    }
+
+    path = _OUTPUT / f"scores_{week_ending}.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return str(path)
+
+
+# ---------------------------------------------------------------------------
+# Cumulative JSON
+# ---------------------------------------------------------------------------
+
+
+def update_cumulative_json(
+    week_ending: str,
+    scores: List[StudentScore],
+    flagged_map: Optional[Dict[str, List[str]]] = None,
+) -> str:
+    """
+    Append (or replace) the current week in leaderboard_cumulative.json.
+    Never overwrites data from other weeks.
+    """
+    _ensure_output()
+    flagged_map = flagged_map or {}
+    cum_path = _OUTPUT / "leaderboard_cumulative.json"
+
+    # Load existing data
+    if cum_path.exists():
+        cumulative = json.loads(cum_path.read_text(encoding="utf-8"))
+    else:
+        cumulative = {"weeks": {}, "totals": {}}
+
+    # Build week entry
+    ranked = sorted(scores, key=lambda s: s.total_pts, reverse=True)
+    week_data = [
+        _score_to_dict(s, flagged_map.get(s.student_id, []))
+        for s in ranked
+    ]
+    cumulative["weeks"][week_ending] = {
+        "generated_at": datetime.now().isoformat(),
+        "students": week_data,
+    }
+
+    # Recalculate running totals across all weeks
+    totals: Dict[str, Dict] = {}
+    for _wk, wk_data in cumulative["weeks"].items():
+        for stu in wk_data["students"]:
+            sid = stu["student_id"]
+            if sid not in totals:
+                totals[sid] = {
+                    "student_id": sid,
+                    "name": stu["name"],
+                    "total_pts": 0,
+                    "total_active_hours": 0,
+                    "weeks_present": 0,
+                }
+            totals[sid]["total_pts"] = round(
+                totals[sid]["total_pts"] + stu["total_pts"], 2
+            )
+            totals[sid]["total_active_hours"] = round(
+                totals[sid]["total_active_hours"] + stu["active_hours"], 2
+            )
+            if stu["active_hours"] > 0:
+                totals[sid]["weeks_present"] += 1
+
+    # Sort totals by points descending and assign ranks
+    sorted_totals = sorted(totals.values(), key=lambda t: t["total_pts"], reverse=True)
+    for i, t in enumerate(sorted_totals, 1):
+        t["rank"] = i
+
+    cumulative["totals"] = sorted_totals
+    cumulative["last_updated"] = datetime.now().isoformat()
+
+    cum_path.write_text(json.dumps(cumulative, indent=2), encoding="utf-8")
+    return str(cum_path)
+
+
+# ---------------------------------------------------------------------------
+# CSV report
+# ---------------------------------------------------------------------------
+
+_CSV_COLUMNS = [
+    "student_id", "name", "active_hours", "base_pts", "attend_bonus",
+    "activity_bonus", "beh_bonus", "penalty", "total_pts", "grade",
+    "flagged_apps",
+]
+
+
+def save_csv_report(
+    week_ending: str,
+    scores: List[StudentScore],
+    flagged_map: Optional[Dict[str, List[str]]] = None,
+) -> str:
+    """Save data/output/report_YYYY-MM-DD.csv and return the path."""
+    _ensure_output()
+    flagged_map = flagged_map or {}
+
+    ranked = sorted(scores, key=lambda s: s.total_pts, reverse=True)
+    path = _OUTPUT / f"report_{week_ending}.csv"
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_CSV_COLUMNS)
+        writer.writeheader()
+        for s in ranked:
+            row = _score_to_dict(s, flagged_map.get(s.student_id, []))
+            row["flagged_apps"] = "; ".join(row["flagged_apps"])
+            del row["date"]
+            writer.writerow(row)
+
+    return str(path)
+
+
+# ---------------------------------------------------------------------------
+# Console leaderboard
+# ---------------------------------------------------------------------------
+
+
+def print_leaderboard(scores: List[StudentScore]):
+    """Print a ranked leaderboard to the console."""
+    ranked = sorted(scores, key=lambda s: s.total_pts, reverse=True)
+
+    width = 72
+    print("\n" + "=" * width)
+    print("  🏆  WEEKLY LEADERBOARD")
+    print("=" * width)
+    print(
+        f"  {'Rank':<6}{'Name':<22}{'Hours':>7}{'Points':>9}{'Grade':>7}"
+    )
+    print("  " + "-" * (width - 2))
+
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for i, s in enumerate(ranked, 1):
+        medal = medals.get(i, "  ")
+        print(
+            f"  {medal} {i:<4}"
+            f"{s.name:<22}"
+            f"{s.active_hours:>6.1f}h"
+            f"{s.total_pts:>9.1f}"
+            f"{s.grade:>6}"
+        )
+
+    print("=" * width + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Main aggregate function
+# ---------------------------------------------------------------------------
+
+
+def aggregate(
+    week_ending: str,
+    scores: List[StudentScore],
+    flagged_map: Optional[Dict[str, List[str]]] = None,
+) -> Dict[str, str]:
+    """
+    Run all aggregation: save weekly JSON, update cumulative,
+    save CSV, print leaderboard.
+
+    Returns dict of output file paths.
+    """
+    flagged_map = flagged_map or {}
+
+    weekly_path = save_weekly_json(week_ending, scores, flagged_map)
+    cum_path = update_cumulative_json(week_ending, scores, flagged_map)
+    csv_path = save_csv_report(week_ending, scores, flagged_map)
+    print_leaderboard(scores)
+
+    print(f"  📄 Weekly JSON  : {weekly_path}")
+    print(f"  📄 Cumulative   : {cum_path}")
+    print(f"  📄 CSV Report   : {csv_path}\n")
+
+    return {
+        "weekly_json": weekly_path,
+        "cumulative_json": cum_path,
+        "csv_report": csv_path,
+    }
